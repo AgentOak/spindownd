@@ -1,0 +1,438 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+
+/*
+ * Error handling
+ */
+
+ini_set("display_errors", "On");
+ini_set("error_reporting", (string)E_ALL);
+
+function printVerbose(string $message, Device $device = null) {
+    if (defined("VERBOSE") && VERBOSE) {
+        printInfo($message, $device);
+    }
+}
+
+function printInfo(string $message, Device $device = null) {
+    if ($device !== null) {
+        $message = "[Device " . $device->getName() . "] $message";
+    }
+
+    fwrite(STDOUT, $message . PHP_EOL);
+}
+
+function printError(string $message, Device $device = null) {
+    if ($device !== null) {
+        $message = "[Device " . $device->getName() . "] $message";
+    }
+
+    fwrite(STDERR, $message . PHP_EOL);
+}
+
+set_error_handler(static function (int $errno, string $errstr, string $errfile, int $errline): bool {
+    if ($errno & (E_STRICT | E_DEPRECATED | E_USER_DEPRECATED | E_USER_NOTICE | E_USER_WARNING) !== 0) {
+        printError("[PHP] $errstr" . PHP_EOL . "\t(in $errfile:$errline)");
+        return true; // Do not ever run the weird php error handler
+    }
+
+    // Unexpected, critical error
+    throw new ErrorException($errstr, 0, $errno, $errfile, $errline);
+});
+
+set_exception_handler(static function (Throwable $throwable): void {
+    printError(PHP_EOL . $throwable . PHP_EOL);
+    die(1);
+});
+
+/*
+ * Classes
+ */
+
+class DeviceException extends Exception {
+}
+
+class Device {
+    protected const CHECK_COMMAND = "/usr/sbin/smartctl -i -n standby %device%";
+    protected const CHECK_CODE_STANDBY = 2;
+    protected const CHECK_CODE_ACTIVE = 0;
+    protected const SPINDOWN_COMMAND = "/sbin/hdparm -y %device%";
+    protected const SPINDOWN_CODE_SUCCESS = 0;
+
+    /**
+     * @var string
+     */
+    protected $name;
+    /**
+     * @var DiskStats
+     */
+    protected $diskStats;
+    /**
+     * @var int
+     */
+    protected $lastIOTime;
+    /**
+     * The default is active to not trigger the spun up notice in the first run of our main loop
+     * 
+     * @var bool
+     */
+    protected $standby = false;
+    /**
+     * @var int
+     */
+    protected $spindowns = 0;
+    /**
+     * Default is true because we make sure all devices exist initially
+     *
+     * @var bool
+     */
+    protected $online = true;
+
+    /**
+     * @param string $name Short device name, e.g. "sda"
+     */
+    public function __construct(string $name, DiskStats $diskStats) {
+        $this->name = $name;
+        $this->diskStats = $diskStats;
+        $this->lastIOTime = time();
+    }
+
+    public function getName(): string {
+        return $this->name;
+    }
+
+    public function getLastIOTime(): int {
+        return $this->lastIOTime;
+    }
+
+    public function isStandby(): bool {
+        return $this->standby;
+    }
+
+    public function getSpindowns(): int {
+        return $this->spindowns;
+    }
+
+    public function setOnline(bool $online): void {
+        $this->online = $online;
+    }
+
+    public function isOnline(): bool {
+        return $this->online;
+    }
+
+    /**
+     * @return bool Whether the device has spun up since last known state
+     * @throws DeviceException
+     */
+    public function updateStandby(): bool {
+        $output = [];
+        $code = null;
+        exec(str_replace("%device%", escapeshellarg("/dev/" . $this->name), self::CHECK_COMMAND), $output, $code);
+
+        // Note possible confusion with errors, as smartctl also returns 2 for insufficient permissions
+        if ($code !== self::CHECK_CODE_STANDBY && $code !== self::CHECK_CODE_ACTIVE) {
+            throw new DeviceException("Standby check command returned unexpected exit code ($code). Output: "
+                . PHP_EOL . implode(PHP_EOL, $output));
+        }
+
+        $newStandby = $code === self::CHECK_CODE_STANDBY;
+        $spunUp = $this->standby && !$newStandby;
+        $this->standby = $newStandby;
+        return $spunUp;
+    }
+
+    /**
+     * @return bool Whether I/O accesses happened since last known state
+     */
+    public function updateDiskStats(DiskStats $newDiskStats): bool {
+        $oldDiskStats = $this->diskStats;
+        $this->diskStats = $newDiskStats;
+
+        /*
+         * Using not equals instead of greater than, because when disks are unplugged and replugged,
+         * they start with 0 reads/writes in diskstats again.
+         */
+        if ($newDiskStats->getReads() !== $oldDiskStats->getReads()
+            || $newDiskStats->getWrites() !== $oldDiskStats->getWrites()) {
+            $this->lastIOTime = $newDiskStats->getTime();
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @throws DeviceException
+     */
+    public function spindown(): void {
+        $output = [];
+        $code = null;
+        exec(str_replace("%device%", escapeshellarg("/dev/" . $this->name), self::SPINDOWN_COMMAND), $output, $code);
+
+        $this->spindowns++;
+
+        if ($code !== self::SPINDOWN_CODE_SUCCESS) {
+            throw new DeviceException("Spindown command returned unexpected exit code ($code). Output: "
+                . PHP_EOL . implode(PHP_EOL, $output));
+        }
+
+        $this->standby = true;
+    }
+
+    public function resetSpindowns(): void {
+        $this->spindowns = 0;
+    }
+
+    /**
+     * @throws DeviceException
+     */
+    public static function normalizeName(string $input): string {
+        // Check if file exists before assuming it is short identifier, because depending on pwd it might be valid
+        if (strpos($input, "/") === false && realpath($input) === false) {
+            $deviceFile = realpath("/dev/$input");
+        } else {
+            $deviceFile = realpath($input);
+        }
+
+        $match = null;
+        if ($deviceFile === false) {
+            throw new DeviceException("Device file '$input' does not exist");
+        } elseif (filetype($deviceFile) !== "block") {
+            throw new DeviceException("Device file '$deviceFile' (resolved from input '$input') is not a block device");
+        } elseif (!preg_match("~/dev/([a-z]+)~", $deviceFile, $match)) {
+            throw new DeviceException("Device file '$deviceFile' (resolved from input '$input')"
+                . "does not match expected pattern /dev/[a-z]+");
+        }
+
+        return $match[1];
+    }
+}
+
+class DiskStats {
+    protected const DISKSTATS_FILE = "/proc/diskstats";
+    protected const DISKSTATS_FORMAT = "%d %d %s %u %u %u %u %u %u %u %u %u %u %u";
+    protected const DISKSTATS_DEVNAME_INDEX = 2;
+    protected const DISKSTATS_READS_INDEX = 5;
+    protected const DISKSTATS_WRITES_INDEX = 9;
+
+    /**
+     * @var string
+     */
+    protected $device;
+    /**
+     * @var int
+     */
+    protected $time;
+    /**
+     * @var int
+     */
+    protected $reads = 0;
+    /**
+     * @var int
+     */
+    protected $writes = 0;
+
+    public function __construct(string $device, int $time) {
+        $this->device = $device;
+        $this->time = $time;
+    }
+
+    public function getDevice(): string {
+        return $this->device;
+    }
+
+    public function getTime(): int {
+        return $this->time;
+    }
+
+    public function getReads(): int {
+        return $this->reads;
+    }
+
+    public function getWrites(): int {
+        return $this->writes;
+    }
+
+    protected static function fromDiskStatsLine(string $line, int $time): DiskStats {
+        $stats = sscanf($line, self::DISKSTATS_FORMAT);
+
+        $diskstat = new DiskStats($stats[self::DISKSTATS_DEVNAME_INDEX], $time);
+        $diskstat->reads = $stats[self::DISKSTATS_READS_INDEX];
+        $diskstat->writes = $stats[self::DISKSTATS_WRITES_INDEX];
+        return $diskstat;
+    }
+
+    public static function readDiskStats(): array {
+        $handle = fopen(self::DISKSTATS_FILE, "rb");
+        $now = time();
+
+        $diskstats = [];
+        while (($line = fgets($handle)) !== false) {
+            $diskstat = self::fromDiskStatsLine($line, $now);
+            $diskstats[$diskstat->getDevice()] = $diskstat;
+        }
+
+        fclose($handle);
+        return $diskstats;
+    }
+}
+
+/*
+ * Option parsing
+ */
+
+$options = getopt("hHvl:t:s:c:", [], $optind);
+if ($options === false || array_key_exists("h", $options) || array_key_exists("H", $options) || $argc - $optind < 1) {
+    // TODO: Usage/help
+}
+
+define("VERBOSE", array_key_exists("v", $options)); // Constant is read in printVerbose()
+
+$opt = static function (string $name, int $default, int $min, string $minMessage) use ($options): int {
+    if (!array_key_exists($name, $options)) {
+        // Note: min may actually be higher than our default because it depends on other options
+        return max($default, $min);
+    }
+
+    // Not using is_numeric here because we only want to allow integers
+    $filtered = filter_var($options[$name], FILTER_VALIDATE_INT);
+    if ($filtered === false) {
+        printError("Value for option '$name' must be an integer");
+        die(3);
+    } elseif ($filtered < $min) {
+        printError("Value for option '$name' must be greater than or equal to $min ($minMessage)");
+        die(3);
+    }
+    return $filtered;
+};
+
+$spindownLimit = $opt("l", 6, 1, "at least one spindown allowed");
+$checkInterval = $opt("c", 3 * 60, 1, "at least one second between checks");
+$spindownTime = $opt("s", 30 * 60, $checkInterval, "the check interval");
+$spindownLimitPeriod = $opt("t", 24 * 60 * 60, $spindownTime, "the spindown time");
+
+$diskStats = DiskStats::readDiskStats();
+
+$deviceInputs = array_slice($argv, $optind);
+$devices = [];
+foreach ($deviceInputs as $deviceInput) {
+    try {
+        $deviceName = Device::normalizeName($deviceInput);
+
+        if (!array_key_exists($deviceName, $diskStats)) {
+            throw new DeviceException("Device '$deviceName' (resolved from input '$deviceInput')"
+                . " is not present in diskstats");
+        }
+
+        printInfo("Adding device '$deviceInput' (which is $deviceName)");
+        $devices[] = new Device($deviceName, $diskStats[$deviceName]);
+    } catch (DeviceException $e) {
+        printError($e->getMessage());
+        die(2);
+    }
+}
+
+unset($opt, $options, $optind, $diskStats, $deviceInputs, $deviceName, $deviceInput);
+
+/*
+ * Main program loop
+ */
+
+$checkTime = time();
+$lastResetTime = $checkTime;
+
+while (true) {
+    $diskStats = DiskStats::readDiskStats();
+
+    array_walk($devices, static function (Device $device)
+        use ($diskStats, $spindownLimit, $spindownTime, $checkTime): void {
+        try {
+            // Skip disks that are (temporarily) offline without crashing
+            if (!array_key_exists($device->getName(), $diskStats)) {
+                if ($device->isOnline()) {
+                    printInfo("Device not found in diskstats, ignoring for now", $device);
+                    $device->setOnline(false);
+                }
+                return;
+            } elseif (!$device->isOnline()) {
+                printInfo("Device is online again", $device);
+                $device->setOnline(true);
+            }
+
+            $diskStat = $diskStats[$device->getName()];
+
+            /*
+             * Note that when a disk wakes up due to I/O, during spinup it will already show as active,
+             * but no I/O accesses are added to diskstats until several seconds later, leading to wrong notices below.
+             */
+            $hadIO = $device->updateDiskStats($diskStat);
+            $spunUp = $device->updateStandby();
+
+            printVerbose("reads=" . $diskStat->getReads() . ", writes=" . $diskStat->getWrites(), $device);
+            printVerbose("status=" . ($device->isStandby() ? "standby" : "active") . ", lastIO="
+                . $device->getLastIOTime() . " (" . ($checkTime - $device->getLastIOTime()) . " seconds ago)",
+                $device);
+
+            if ($spunUp) {
+                if ($hadIO) {
+                    printInfo("Disk has spun up due to I/O accesses", $device);
+                } else {
+                    printInfo("Disk has spun up for unknown reasons or is currently waking up. If it was just"
+                        . " spun down by this daemon, it might also mean spindown isn't working", $device);
+                }
+            } elseif ($hadIO && $device->isStandby()) {
+                printError("Disk had I/O accesses but is in standby. Something else might have spun down the disk",
+                    $device);
+            }
+
+            /*
+             * Only spin down disks that:
+             * - Did not reach spindown limit yet
+             * - Are currently active
+             * - Have had no I/O for at least $spindownTime
+             * - Aren't currently waking up
+             */
+            if ($device->getSpindowns() < $spindownLimit && !$device->isStandby()
+                && $checkTime >= $device->getLastIOTime() + $spindownTime
+                && !($spunUp && !$hadIO)) {
+                printInfo("Spinning down disk, because it had no more I/O accesses for at least "
+                    . ($checkTime - $device->getLastIOTime()) . " seconds", $device);
+
+                $device->spindown();
+
+                if ($device->getSpindowns() >= $spindownLimit) {
+                    printError("Disk has reached the spindown limit of $spindownLimit and will be exempt until reset."
+                        . " Maybe spindown isn't working. Otherwise consider increasing the spindown time to prevent"
+                        . " shortening the disks life", $device);
+                }
+            }
+        } catch (DeviceException $e) {
+            printError($e->getMessage(), $device);
+        }
+    });
+
+    $checkTime += $checkInterval;
+    $sleepTime = $checkTime - time();
+    if ($sleepTime > 0) {
+        sleep($sleepTime);
+    } else {
+        printError("Cannot keep up with the given check interval of $checkInterval seconds, "
+            . "effectively running in a busy loop. Consider increasing the check interval");
+    }
+
+    if ($checkTime >= $lastResetTime + $spindownLimitPeriod) {
+        // TODO: Statistics like how many seconds/minutes each disk was active and how long it was in standby,
+        //       last $spindownLimitPeriod and total
+
+        printInfo("Resetting spindown limits. Statistics for the past $spindownLimitPeriod seconds:");
+
+        array_walk($devices, static function (Device $device): void {
+            printInfo("Spindowns: " . $device->getSpindowns(), $device);
+            $device->resetSpindowns();
+        });
+
+        $lastResetTime = $checkTime;
+    }
+}
