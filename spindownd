@@ -2,6 +2,9 @@
 <?php
 declare(strict_types=1);
 
+const SPINDOWND_VERSION = "1.0";
+const SPINDOWND_COPYRIGHT = "Copyright (C) 2019 Jan Erik Petersen";
+
 /*
  * Error handling
  */
@@ -43,7 +46,7 @@ set_error_handler(static function (int $errno, string $errstr, string $errfile, 
 
 set_exception_handler(static function (Throwable $throwable): void {
     printError(PHP_EOL . $throwable . PHP_EOL);
-    die(1);
+    die(100);
 });
 
 /*
@@ -74,7 +77,7 @@ class Device {
     protected $lastIOTime;
     /**
      * The default is active to not trigger the spun up notice in the first run of our main loop
-     * 
+     *
      * @var bool
      */
     protected $standby = false;
@@ -281,9 +284,40 @@ class DiskStats {
  * Option parsing
  */
 
-$options = getopt("hHvl:t:s:c:", [], $optind);
-if ($options === false || array_key_exists("h", $options) || array_key_exists("H", $options) || $argc - $optind < 1) {
-    // TODO: Usage/help
+$options = getopt("hHvVl:t:s:c:", ["help", "version"], $optind);
+
+if (array_key_exists("version", $options) || array_key_exists("V", $options)) {
+    printInfo("spindownd " . SPINDOWND_VERSION);
+    printInfo(SPINDOWND_COPYRIGHT);
+    die(0);
+}
+
+$helpRequested = array_key_exists("help", $options)
+    || array_key_exists("h", $options) || array_key_exists("H", $options);
+if ($options === false || ($argc - $optind) < 1 || $helpRequested) {
+    printError(implode(PHP_EOL, [
+        "Usage: " . $argv[0] . " [options] devices...",
+        "",
+        "Daemon to spin down active hard disks after a period of inactivity.",
+        "Features a spindown limit to prevent excessive wear on the disks.",
+        "",
+        "Device selection:",
+        "  Devices can be specified as 'sdX', '/dev/XXX' or any symlink pointing to '/dev/XXX'.",
+        "  It is recommended to uniquely identify devices by specifying their /dev/disk/by-id/ symlink.",
+        "",
+        "  All devices specified have to exist when starting this script.",
+        "  When they are removed while this script is running, they are temporarily ignored until replugged.",
+        "",
+        "Options:",
+        "  -H, --help       print help and exit",
+        "  -V, --version    print version and exit",
+        "  -v               enable more verbose messages",
+        "  -l <limit>       maximum number of spindowns per disk per reset period. Default 6",
+        "  -c <seconds>     time between idle checks. Default 180",
+        "  -s <seconds>     time after which idle disks are spun down. Default 1800",
+        "  -t <seconds>     reset period, after which spindown limits are reset. Default 86400"
+    ]));
+    die($helpRequested ? 0 : 1);
 }
 
 $intOpt = static function (string $name, int $default, int $min, string $minMessage) use ($options): int {
@@ -306,7 +340,16 @@ $checkInterval = $intOpt("c", 3 * 60, 1, "at least one second between checks");
 $spindownTime = $intOpt("s", 30 * 60, $checkInterval, "the check interval");
 $spindownLimitPeriod = $intOpt("t", 24 * 60 * 60, $spindownTime, "the spindown time");
 
+/*
+ * Startup
+ */
+
+printInfo("Starting spindownd " . SPINDOWND_VERSION);
+
 $diskStats = DiskStats::readDiskStats();
+
+// TODO: Remeber the original device arguments, and (re-)detect devices automatically at runtime,
+//       no longer requiring them to be available on startup.
 
 $deviceInputs = array_slice($argv, $optind);
 $devices = [];
@@ -327,7 +370,7 @@ foreach ($deviceInputs as $deviceInput) {
     }
 }
 
-unset($intOpt, $options, $optind, $diskStats, $deviceInputs, $deviceName, $deviceInput);
+unset($intOpt, $options, $helpRequested, $optind, $diskStats, $deviceInputs, $deviceName, $deviceInput);
 
 /*
  * Main program loop
@@ -340,7 +383,7 @@ while (true) {
     $diskStats = DiskStats::readDiskStats();
 
     array_walk($devices, static function (Device $device)
-        use ($diskStats, $spindownLimit, $spindownTime, $checkTime): void {
+    use ($diskStats, $spindownLimit, $spindownTime, $checkTime): void {
         try {
             // Skip disks that are (temporarily) offline without crashing
             if (!array_key_exists($device->getName(), $diskStats)) {
