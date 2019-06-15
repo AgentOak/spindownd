@@ -11,7 +11,7 @@ ini_set("error_reporting", (string)E_ALL);
 
 function printVerbose(string $message, Device $device = null) {
     if (defined("VERBOSE") && VERBOSE) {
-        printInfo($message, $device);
+        printInfo("debug: $message", $device);
     }
 }
 
@@ -83,8 +83,6 @@ class Device {
      */
     protected $spindowns = 0;
     /**
-     * Default is true because we make sure all devices exist initially
-     *
      * @var bool
      */
     protected $online = true;
@@ -191,18 +189,18 @@ class Device {
     public static function normalizeName(string $input): string {
         // Check if file exists before assuming it is short identifier, because depending on pwd it might be valid
         if (strpos($input, "/") === false && realpath($input) === false) {
-            $deviceFile = realpath("/dev/$input");
+            $device = realpath("/dev/$input");
         } else {
-            $deviceFile = realpath($input);
+            $device = realpath($input);
         }
 
         $match = null;
-        if ($deviceFile === false) {
+        if ($device === false) {
             throw new DeviceException("Device file '$input' does not exist");
-        } elseif (filetype($deviceFile) !== "block") {
-            throw new DeviceException("Device file '$deviceFile' (resolved from input '$input') is not a block device");
-        } elseif (!preg_match("~/dev/([a-z]+)~", $deviceFile, $match)) {
-            throw new DeviceException("Device file '$deviceFile' (resolved from input '$input')"
+        } elseif (filetype($device) !== "block") {
+            throw new DeviceException("File '$device' (resolved from input '$input') is not a block device");
+        } elseif (!preg_match("~/dev/([a-z]+)~", $device, $match)) {
+            throw new DeviceException("File '$device' (resolved from input '$input')"
                 . "does not match expected pattern /dev/[a-z]+");
         }
 
@@ -288,9 +286,7 @@ if ($options === false || array_key_exists("h", $options) || array_key_exists("H
     // TODO: Usage/help
 }
 
-define("VERBOSE", array_key_exists("v", $options)); // Constant is read in printVerbose()
-
-$opt = static function (string $name, int $default, int $min, string $minMessage) use ($options): int {
+$intOpt = static function (string $name, int $default, int $min, string $minMessage) use ($options): int {
     if (!array_key_exists($name, $options)) {
         // Note: min may actually be higher than our default because it depends on other options
         return max($default, $min);
@@ -298,20 +294,17 @@ $opt = static function (string $name, int $default, int $min, string $minMessage
 
     // Not using is_numeric here because we only want to allow integers
     $filtered = filter_var($options[$name], FILTER_VALIDATE_INT);
-    if ($filtered === false) {
-        printError("Value for option '$name' must be an integer");
-        die(3);
-    } elseif ($filtered < $min) {
-        printError("Value for option '$name' must be greater than or equal to $min ($minMessage)");
+    if ($filtered === false || $filtered < $min) {
+        printError("Value for option '$name' must be an integer greater than or equal to $min ($minMessage)");
         die(3);
     }
     return $filtered;
 };
 
-$spindownLimit = $opt("l", 6, 1, "at least one spindown allowed");
-$checkInterval = $opt("c", 3 * 60, 1, "at least one second between checks");
-$spindownTime = $opt("s", 30 * 60, $checkInterval, "the check interval");
-$spindownLimitPeriod = $opt("t", 24 * 60 * 60, $spindownTime, "the spindown time");
+$spindownLimit = $intOpt("l", 6, 1, "at least one spindown allowed");
+$checkInterval = $intOpt("c", 3 * 60, 1, "at least one second between checks");
+$spindownTime = $intOpt("s", 30 * 60, $checkInterval, "the check interval");
+$spindownLimitPeriod = $intOpt("t", 24 * 60 * 60, $spindownTime, "the spindown time");
 
 $diskStats = DiskStats::readDiskStats();
 
@@ -334,7 +327,7 @@ foreach ($deviceInputs as $deviceInput) {
     }
 }
 
-unset($opt, $options, $optind, $diskStats, $deviceInputs, $deviceName, $deviceInput);
+unset($intOpt, $options, $optind, $diskStats, $deviceInputs, $deviceName, $deviceInput);
 
 /*
  * Main program loop
